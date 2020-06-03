@@ -1,6 +1,5 @@
 from tensorflow.keras import Model, layers, Sequential, optimizers
 import tensorflow as tf
-import pysnooper
 import numpy as np
 import getConfig
 from glob import glob
@@ -8,7 +7,10 @@ import os
 import time
 from buildSummary import *
 import sys
+from PIL import Image
+import os
 
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 config = getConfig.get_config()
 
 
@@ -19,6 +21,7 @@ class SRGAN(object):
         self.beta_1 = config['beta_1']
         self.beta_2 = config['beta_2']
         self.lambd = config['lambda']
+        self.psnr = config['psnr']
         self.generator = Generator()
         self.discriminator = Discriminator()
         self.optimizer_g = tf.keras.optimizers.Adam(learning_rate=self.learning_rate,
@@ -27,9 +30,6 @@ class SRGAN(object):
         self.optimizer_d = tf.keras.optimizers.Adam(learning_rate=self.learning_rate,
                                                     beta_1=self.beta_1,
                                                     beta_2=self.beta_2)
-        self.optimizer_content = tf.keras.optimizers.Adam(learning_rate=self.learning_rate,
-                                                          beta_1=self.beta_1,
-                                                          beta_2=self.beta_2)
         self.checkpoint = tf.train.Checkpoint(optimizer_g=self.optimizer_g,
                                               optimizer_d=self.optimizer_d,
                                               generator=self.generator,
@@ -40,12 +40,14 @@ class SRGAN(object):
         self.img_height = config['image_height']
         self.img_channels = config['image_channels']
         self.dataset_train_image_path = config['dataset_train_image_path']
+        self.dataset_test_image_path = config['dataset_test_image_path']
+        self.dataset_gan_image_path = config['dataset_gan_image_path']
         self.checkpoint_dir = config['checkpoint_dir']
 
     def build_model(self):
-        self.generator.build(input_shape=(1, 64, 64, 3))
+        self.generator.build(input_shape=(1, 32, 32, 3))
         self.generator.summary()
-        self.discriminator.build(input_shape=(1, 256, 256, 3))
+        self.discriminator.build(input_shape=(1, 128, 128, 3))
         self.discriminator.summary()
         # 使用Checkpoint，保存训练模型
         return self.generator, self.discriminator
@@ -77,6 +79,11 @@ class SRGAN(object):
 
         return d_loss, g_loss, content_loss
 
+    def PSNR(self, real, fake):
+        mse = tf.reduce_mean(tf.square(127.5 * (real - fake) + 127.5), axis=(-3, -2, -1))
+        psnr = tf.reduce_mean(10 * (tf.math.log(255 * 255 / tf.math.sqrt(mse)) / np.log(10)))
+        return psnr
+
     def train(self):
         data = glob(os.path.join(self.dataset_train_image_path, '*.*'))
         ckpt = tf.train.get_checkpoint_state(self.checkpoint_dir)
@@ -88,44 +95,50 @@ class SRGAN(object):
         train_db = train_db.shuffle(1000).map(self.preprocess).batch(self.batch_size).repeat()
         db_summary("train_db", train_db)
         print('total steps:{}'.format(self.steps))
-
+        c_psnr = 0
         for step, imgs in enumerate(train_db):
             start_time = time.time()
             # imgs: [b,256,256,3]
             # g_input: [b,64,64,3]
             g_input = self.down_sample_layer(imgs)
             real = imgs
-            # with tf.GradientTape() as tape:
-            #     fake = self.generator(g_input)
-            #     content_loss = self.mse_content_loss(real, fake)
-            #     psnr = tf.image.psnr(real, fake, max_val=1.0)
-            # grads = tape.gradient(content_loss, self.generator.trainable_variables)
-            # self.optimizer_g.apply_gradients(zip(grads, self.generator.trainable_variables))
-            # print("step:", step, 'content_loss:', float(content_loss), "psnr:", psnr)
-            with tf.GradientTape() as tape:
-                fake = self.generator(g_input)
-                _, g_loss, _ = self.inference_loss(real, fake)
-                psnr = tf.image.psnr(real, fake, max_val=1.0)
-            grads = tape.gradient(g_loss, self.generator.trainable_variables)
-            self.optimizer_g.apply_gradients(zip(grads, self.generator.trainable_variables))
-            print("step:", step, 'g_loss:', float(g_loss), "psnr:", float(tf.reduce_mean(psnr)))
-
-            with tf.GradientTape() as tape:
-                fake = self.generator(g_input)
-                d_loss, _, _ = self.inference_loss(real, fake)
-            grads = tape.gradient(d_loss, self.discriminator.trainable_variables)
-            self.optimizer_d.apply_gradients(zip(grads, self.discriminator.trainable_variables))
-            print("step:", step, 'd_loss:', float(d_loss))
-            end_time = time.time()
-            scalar_summary("g_loss", g_loss, step)
-            scalar_summary("psnr", float(tf.reduce_mean(psnr)), step)
-            scalar_summary("d_loss", d_loss, step)
-            print(step,
-                  "Estimated time remaining {} seconds".format(int((self.steps - step) * (end_time - start_time))))
-            if (step + 1) % 10 == 0:
-                self.checkpoint.save(file_prefix=checkpoint_prefix)
-            if step > self.steps:
-                break
+            if c_psnr < self.psnr:
+                with tf.GradientTape() as tape:
+                    fake = self.generator(g_input)
+                    content_loss = tf.reduce_mean(tf.square(real - fake))
+                    # c_psnr = self.PSNR(real, fake)
+                    c_psnr = tf.reduce_mean(tf.image.psnr(real, fake, max_val=2.0))
+                grads = tape.gradient(content_loss, self.generator.trainable_variables)
+                self.optimizer_g.apply_gradients(zip(grads, self.generator.trainable_variables))
+                print("step:", step, 'content_loss:', float(content_loss), "psnr:", float(c_psnr))
+                scalar_summary("content_loss", content_loss, step)
+                if (step + 1) % 1000 == 0:
+                    self.checkpoint.save(file_prefix=checkpoint_prefix)
+            else:
+                with tf.GradientTape() as tape:
+                    fake = self.generator(g_input)
+                    _, g_loss, _ = self.inference_loss(real, fake)
+                    # psnr = self.PSNR(real, fake)
+                    c_psnr = tf.reduce_mean(tf.image.psnr(real, fake, max_val=2.0))
+                grads = tape.gradient(g_loss, self.generator.trainable_variables)
+                self.optimizer_g.apply_gradients(zip(grads, self.generator.trainable_variables))
+                print("step:", step, 'g_loss:', float(g_loss), "psnr:", float(c_psnr))
+                with tf.GradientTape() as tape:
+                    fake = self.generator(g_input)
+                    d_loss, _, _ = self.inference_loss(real, fake)
+                grads = tape.gradient(d_loss, self.discriminator.trainable_variables)
+                self.optimizer_d.apply_gradients(zip(grads, self.discriminator.trainable_variables))
+                print("step:", step, 'd_loss:', float(d_loss))
+                end_time = time.time()
+                scalar_summary("g_loss", g_loss, step)
+                scalar_summary("psnr", float(tf.reduce_mean(c_psnr)), step)
+                scalar_summary("d_loss", d_loss, step)
+                print(step,
+                      "Estimated time remaining {} seconds".format(int((self.steps - step) * (end_time - start_time))))
+                if (step + 1) % 100 == 0:
+                    self.checkpoint.save(file_prefix=checkpoint_prefix)
+                if step > self.steps:
+                    break
             sys.stdout.flush()
 
     def preprocess(self, img):
@@ -139,9 +152,64 @@ class SRGAN(object):
         img = tf.cast(img, dtype=tf.uint8)
         # img: dtype:unit8
         img = tf.image.random_crop(img, [self.img_width, self.img_height, 3])
-        # img: dtype: float32
-        img = tf.image.convert_image_dtype(img, dtype=tf.float32)
+        # img: dtype: float32 [-1,1]
+        img = tf.image.convert_image_dtype(img, dtype=tf.float32) * 2 - 1
         return img
+
+    def test(self):
+        ckpt = tf.train.get_checkpoint_state(self.checkpoint_dir)
+        if ckpt:
+            print("reload pretrained model")
+            self.checkpoint.restore(tf.train.latest_checkpoint(self.checkpoint_dir))
+        data = glob(os.path.join(self.dataset_test_image_path, '*.*'))
+        data = tf.convert_to_tensor(data, dtype=tf.string)
+        imgs = np.zeros([len(data), self.img_width, self.img_height, self.img_channels])
+        for i in range(len(data)):
+            img = self.preprocess(data[i])
+            imgs[i] = img
+        # imgs: [4,256,256,3]
+        # imgs_down: [4,64,64,3]
+        imgs_down = self.down_sample_layer(imgs)
+        # imgs_sr: [4,256,256,3]
+        imgs_sr = self.generator(imgs_down)
+        self.save_images(np.asarray(imgs), 2, '{}/gt_hr.png'.format(self.dataset_gan_image_path))
+        self.save_images(np.asarray(imgs_sr), 2, '{}/test_hr.png'.format(self.dataset_gan_image_path))
+        self.save_images(np.asarray(imgs_down), 2, '{}/gt_lr.png'.format(self.dataset_gan_image_path))
+
+    # def save_images(self, val_out, image_path):
+    #     img = ((val_out + 1.0) * 127.5).astype(np.uint8)
+    #     print(img)
+    #     Image.fromarray(img).save(image_path)
+
+    def save_images(self, val_out, val_block_size, image_path):
+        def preprocess(img):
+            img = ((img + 1.0) * 127.5).astype(np.uint8)
+            # img = img.astype(np.uint8)
+            return img
+
+        preprocesed = preprocess(val_out)
+        final_image = np.array([])
+        single_row = np.array([])
+        for b in range(val_out.shape[0]):
+            # concat image into a row
+            if single_row.size == 0:
+                single_row = preprocesed[b, :, :, :]
+            else:
+                single_row = np.concatenate((single_row, preprocesed[b, :, :, :]), axis=1)
+
+            # concat image row to final_image
+            if (b + 1) % val_block_size == 0:
+                if final_image.size == 0:
+                    final_image = single_row
+                else:
+                    final_image = np.concatenate((final_image, single_row), axis=0)
+
+                # reset single row
+                single_row = np.array([])
+
+        if final_image.shape[2] == 1:
+            final_image = np.squeeze(final_image, axis=2)
+        Image.fromarray(final_image).save(image_path)
 
     def down_sample_layer(self, input_x):
         K = 4

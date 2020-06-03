@@ -1,21 +1,17 @@
 from SRGAN import *
 import tensorflow as tf
+import getConfig
 
-# 是否需要执行的步骤
-is_crop = True
-is_testing = True
-is_training = False
+config = getConfig.get_config()
 
 
 def main():
-    srgan = SRGAN(dataset_dir='data/',
-                  is_crop=is_crop,
-                  batch_size=8,
-                  input_height=128, input_width=128, input_channels=3)
-    srgan.build_model()
-    if is_training:
+    srgan = SRGAN()
+    mode = config['mode']
+    if mode == 'train':
+        srgan.build_model()
         srgan.train()
-    if is_testing:
+    elif mode == 'test':
         srgan.test()
 
 
