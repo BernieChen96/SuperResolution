@@ -1,7 +1,6 @@
 from tensorflow.keras import Model, layers, optimizers
 import tensorflow as tf
 import numpy as np
-import tensorboard
 import getConfig
 from glob import glob
 import time
@@ -10,7 +9,6 @@ import sys
 from PIL import Image
 import os
 
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 config = getConfig.get_config()
 
 
@@ -153,7 +151,13 @@ class SRGAN(object):
             final_image = np.squeeze(final_image, axis=2)
         Image.fromarray(final_image).save(image_path)
 
+
     def down_sample_layer(self, input_x):
+        """
+        下采样函数
+        :param input_x:
+        :return:
+        """
         K = 4
         arr = np.zeros([K, K, 3, 3])
         arr[:, :, 0, 0] = 1.0 / K ** 2
