@@ -6,25 +6,25 @@ from matplotlib import patches
 import numpy as np
 
 
-def db_summary(title, db):
+def model_summary(writer):
+    tf.summary.g
+    pass
+
+
+def loss_summary(writer, title, scalar, step):
+    with writer.as_default():
+        tf.summary.scalar(title, scalar, step)
+        writer.flush()
+
+
+def db_summary(writer, title, db):
     sample = next(iter(db))
-    build_summary_image(title, sample, step=0)
+    build_summary_image(writer, title, sample, step=0)
 
 
-def scalar_summary(title, scalar, step):
-    current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    log_dir = 'logs/' + current_time
-    summary_writer = tf.summary.create_file_writer(log_dir)
-    with summary_writer.as_default():
-        tf.summary.scalar(title, scalar, step=step)
-
-
-def build_summary_image(title, images, step):
-    current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    log_dir = 'logs/' + current_time
-    summary_writer = tf.summary.create_file_writer(log_dir)
+def build_summary_image(writer, title, images, step):
     figure = image_grid(np.asarray(images))
-    with summary_writer.as_default():
+    with writer.as_default():
         tf.summary.image(title, plot_to_image(figure), step=step)
 
 

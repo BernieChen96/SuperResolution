@@ -12,7 +12,7 @@ def main():
         srgan.build_model()
         srgan.train()
     elif mode == 'test':
-        srgan.test()
+        srgan.test(mode=mode)
 
 
 if __name__ == '__main__':

@@ -1,9 +1,9 @@
-from tensorflow.keras import Model, layers, Sequential, optimizers
+from tensorflow.keras import Model, layers, optimizers
 import tensorflow as tf
 import numpy as np
+import tensorboard
 import getConfig
 from glob import glob
-import os
 import time
 from buildSummary import *
 import sys
@@ -19,19 +19,14 @@ class SRGAN(object):
     def __init__(self):
         self.learning_rate = config['learning_rate']
         self.beta_1 = config['beta_1']
-        self.beta_2 = config['beta_2']
         self.lambd = config['lambda']
         self.psnr = config['psnr']
         self.generator = Generator()
         self.discriminator = Discriminator()
-        self.optimizer_g = tf.keras.optimizers.Adam(learning_rate=self.learning_rate,
-                                                    beta_1=self.beta_1,
-                                                    beta_2=self.beta_2)
-        self.optimizer_d = tf.keras.optimizers.Adam(learning_rate=self.learning_rate,
-                                                    beta_1=self.beta_1,
-                                                    beta_2=self.beta_2)
-        self.checkpoint = tf.train.Checkpoint(optimizer_g=self.optimizer_g,
-                                              optimizer_d=self.optimizer_d,
+        self.adversarial = Adversarial(self.generator, self.discriminator)
+        self.optimizer = optimizers.Adam(learning_rate=self.learning_rate,
+                                         beta_1=self.beta_1, )
+        self.checkpoint = tf.train.Checkpoint(optimizer=self.optimizer,
                                               generator=self.generator,
                                               discriminator=self.discriminator)
         self.steps = config['steps']
@@ -43,46 +38,17 @@ class SRGAN(object):
         self.dataset_test_image_path = config['dataset_test_image_path']
         self.dataset_gan_image_path = config['dataset_gan_image_path']
         self.checkpoint_dir = config['checkpoint_dir']
+        current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        log_dir = config['writer'] + current_time
+        self.writer = tf.summary.create_file_writer(log_dir)
 
     def build_model(self):
-        self.generator.build(input_shape=(1, 32, 32, 3))
+        self.generator.build(input_shape=(None, 32, 32, 3))
         self.generator.summary()
-        self.discriminator.build(input_shape=(1, 128, 128, 3))
+        self.discriminator.build(input_shape=(None, 128, 128, 3))
         self.discriminator.summary()
-        # 使用Checkpoint，保存训练模型
-        return self.generator, self.discriminator
-
-    def mse_content_loss(self, real, fake):
-        return tf.reduce_mean(tf.square(real - fake))
-
-    def inference_loss(self, real, fake):
-        def inference_mse_content_loss(real, fake):
-            return tf.reduce_mean(tf.square(real - fake))
-
-        def inference_adversarial_loss(x, y, w=1, type_='gan'):
-            if type_ == 'gan':
-                return w * tf.nn.sigmoid_cross_entropy_with_logits(logits=x, labels=y)
-            elif type_ == 'lsgan':
-                return w * (x - y) ** 2
-            else:
-                raise ValueError('no {} loss type'.format(type_))
-
-        content_loss = inference_mse_content_loss(real, fake)
-        d_real_logits = self.discriminator(real)
-        d_fake_logits = self.discriminator(fake)
-        d_fake_loss = tf.reduce_mean(inference_adversarial_loss(d_real_logits, tf.ones_like(d_real_logits)))
-        d_real_loss = tf.reduce_mean(inference_adversarial_loss(d_fake_logits, tf.zeros_like(d_fake_logits)))
-        g_fake_loss = tf.reduce_mean(inference_adversarial_loss(d_fake_logits, tf.ones_like(d_fake_logits)))
-
-        d_loss = self.lambd * (d_fake_loss + d_real_loss)
-        g_loss = content_loss + self.lambd * g_fake_loss
-
-        return d_loss, g_loss, content_loss
-
-    def PSNR(self, real, fake):
-        mse = tf.reduce_mean(tf.square(127.5 * (real - fake) + 127.5), axis=(-3, -2, -1))
-        psnr = tf.reduce_mean(10 * (tf.math.log(255 * 255 / tf.math.sqrt(mse)) / np.log(10)))
-        return psnr
+        self.discriminator.compile(loss='mse', optimizer=self.optimizer, metrics=['accuracy'])
+        self.adversarial.compile(loss=['binary_crossentropy', 'mse'], loss_weights=[1e-3, 1], optimizer=self.optimizer)
 
     def train(self):
         data = glob(os.path.join(self.dataset_train_image_path, '*.*'))
@@ -92,53 +58,33 @@ class SRGAN(object):
             self.checkpoint.restore(tf.train.latest_checkpoint(self.checkpoint_dir))
         checkpoint_prefix = os.path.join(self.checkpoint_dir, "ckpt")
         train_db = tf.data.Dataset.from_tensor_slices(data)
-        train_db = train_db.shuffle(1000).map(self.preprocess).batch(self.batch_size).repeat()
-        db_summary("train_db", train_db)
+        train_db = train_db.shuffle(1000).map(self.preprocess).batch(self.batch_size, drop_remainder=True).repeat()
+        db_summary(self.writer, "train_db", train_db)
         print('total steps:{}'.format(self.steps))
-        c_psnr = 0
         for step, imgs in enumerate(train_db):
             start_time = time.time()
             # imgs: [b,256,256,3]
             # g_input: [b,64,64,3]
             g_input = self.down_sample_layer(imgs)
-            real = imgs
-            if c_psnr < self.psnr:
-                with tf.GradientTape() as tape:
-                    fake = self.generator(g_input)
-                    content_loss = tf.reduce_mean(tf.square(real - fake))
-                    # c_psnr = self.PSNR(real, fake)
-                    c_psnr = tf.reduce_mean(tf.image.psnr(real, fake, max_val=2.0))
-                grads = tape.gradient(content_loss, self.generator.trainable_variables)
-                self.optimizer_g.apply_gradients(zip(grads, self.generator.trainable_variables))
-                print("step:", step, 'content_loss:', float(content_loss), "psnr:", float(c_psnr))
-                scalar_summary("content_loss", content_loss, step)
-                if (step + 1) % 1000 == 0:
-                    self.checkpoint.save(file_prefix=checkpoint_prefix)
-            else:
-                with tf.GradientTape() as tape:
-                    fake = self.generator(g_input)
-                    _, g_loss, _ = self.inference_loss(real, fake)
-                    # psnr = self.PSNR(real, fake)
-                    c_psnr = tf.reduce_mean(tf.image.psnr(real, fake, max_val=2.0))
-                grads = tape.gradient(g_loss, self.generator.trainable_variables)
-                self.optimizer_g.apply_gradients(zip(grads, self.generator.trainable_variables))
-                print("step:", step, 'g_loss:', float(g_loss), "psnr:", float(c_psnr))
-                with tf.GradientTape() as tape:
-                    fake = self.generator(g_input)
-                    d_loss, _, _ = self.inference_loss(real, fake)
-                grads = tape.gradient(d_loss, self.discriminator.trainable_variables)
-                self.optimizer_d.apply_gradients(zip(grads, self.discriminator.trainable_variables))
-                print("step:", step, 'd_loss:', float(d_loss))
-                end_time = time.time()
-                scalar_summary("g_loss", g_loss, step)
-                scalar_summary("psnr", float(tf.reduce_mean(c_psnr)), step)
-                scalar_summary("d_loss", d_loss, step)
-                print(step,
-                      "Estimated time remaining {} seconds".format(int((self.steps - step) * (end_time - start_time))))
-                if (step + 1) % 100 == 0:
-                    self.checkpoint.save(file_prefix=checkpoint_prefix)
-                if step > self.steps:
-                    break
+            real_images = imgs
+            fake_images = self.generator.predict(g_input)
+            real_labels = tf.ones((self.batch_size, int(self.img_width / 2 ** 4), int(self.img_height / 2 ** 4), 1))
+            fake_labels = tf.zeros((self.batch_size, int(self.img_width / 2 ** 4), int(self.img_height / 2 ** 4), 1))
+            self.discriminator.trainable = True
+            d_loss_real = self.discriminator.train_on_batch(real_images, real_labels)
+            d_loss_fake = self.discriminator.train_on_batch(fake_images, fake_labels)
+            d_loss = 0.5 * np.add(d_loss_fake, d_loss_real)
+            self.discriminator.trainable = False
+            g_loss = self.adversarial.train_on_batch(g_input, [real_labels, real_images])
+            loss_summary(self.writer, "g_loss", g_loss[0], step)
+            loss_summary(self.writer, "content_loss", g_loss[2], step)
+            loss_summary(self.writer, "d_loss", d_loss[0], step)
+            loss_summary(self.writer, "psnr", tf.reduce_mean(tf.image.psnr(real_images, fake_images, max_val=2.0)),
+                         step)
+            if step % 1000 == 0:
+                self.test(step=int(step / 1000))
+            if (step + 1) % 1000 == 0:
+                self.checkpoint.save(file_prefix=checkpoint_prefix)
             sys.stdout.flush()
 
     def preprocess(self, img):
@@ -148,19 +94,20 @@ class SRGAN(object):
         img = tf.image.decode_png(img, channels=self.img_channels)
         # resize会将图像数据类型变为float32型，如果想使用convert_image_dtype就先将其转变为unit8型数据，不想这么做就自己实现归一化
         # img: dtype: float32
-        img = tf.image.resize(img, [2 * self.img_width, 2 * self.img_height])
+        img = tf.image.resize(img, [self.img_width, self.img_height])
         img = tf.cast(img, dtype=tf.uint8)
         # img: dtype:unit8
-        img = tf.image.random_crop(img, [self.img_width, self.img_height, 3])
+        # img = tf.image.random_crop(img, [self.img_width, self.img_height, 3])
         # img: dtype: float32 [-1,1]
         img = tf.image.convert_image_dtype(img, dtype=tf.float32) * 2 - 1
         return img
 
-    def test(self):
-        ckpt = tf.train.get_checkpoint_state(self.checkpoint_dir)
-        if ckpt:
-            print("reload pretrained model")
-            self.checkpoint.restore(tf.train.latest_checkpoint(self.checkpoint_dir))
+    def test(self, mode="train", step=0):
+        if mode == "test":
+            ckpt = tf.train.get_checkpoint_state(self.checkpoint_dir)
+            if ckpt:
+                print("reload pretrained model")
+                self.checkpoint.restore(tf.train.latest_checkpoint(self.checkpoint_dir))
         data = glob(os.path.join(self.dataset_test_image_path, '*.*'))
         data = tf.convert_to_tensor(data, dtype=tf.string)
         imgs = np.zeros([len(data), self.img_width, self.img_height, self.img_channels])
@@ -172,14 +119,9 @@ class SRGAN(object):
         imgs_down = self.down_sample_layer(imgs)
         # imgs_sr: [4,256,256,3]
         imgs_sr = self.generator(imgs_down)
-        self.save_images(np.asarray(imgs), 2, '{}/gt_hr.png'.format(self.dataset_gan_image_path))
-        self.save_images(np.asarray(imgs_sr), 2, '{}/test_hr.png'.format(self.dataset_gan_image_path))
-        self.save_images(np.asarray(imgs_down), 2, '{}/gt_lr.png'.format(self.dataset_gan_image_path))
-
-    # def save_images(self, val_out, image_path):
-    #     img = ((val_out + 1.0) * 127.5).astype(np.uint8)
-    #     print(img)
-    #     Image.fromarray(img).save(image_path)
+        self.save_images(np.asarray(imgs), 2, '{}/gt_{}_hr.png'.format(self.dataset_gan_image_path, step))
+        self.save_images(np.asarray(imgs_sr), 2, '{}/test_{}_hr.png'.format(self.dataset_gan_image_path, step))
+        self.save_images(np.asarray(imgs_down), 2, '{}/gt_{}_lr.png'.format(self.dataset_gan_image_path, step))
 
     def save_images(self, val_out, val_block_size, image_path):
         def preprocess(img):
@@ -223,75 +165,48 @@ class SRGAN(object):
         return downscaled
 
 
+class ResBlock(layers.Layer):
+    def __init__(self, filters, kernel_size, strides):
+        super(ResBlock, self).__init__()
+        self.conv1 = layers.Conv2DTranspose(filters=filters, kernel_size=kernel_size, strides=strides, padding='same')
+        self.relu = layers.ReLU()
+        self.norm1 = layers.BatchNormalization(momentum=0.8)
+        self.conv2 = layers.Conv2DTranspose(filters=filters, kernel_size=kernel_size, strides=strides, padding='same')
+        self.norm2 = layers.BatchNormalization(momentum=0.8)
+
+    def call(self, inputs, **kwargs):
+        outputs = self.norm1(self.relu(self.conv1(inputs)))
+        outputs = self.norm2(self.conv2(outputs))
+        return inputs + outputs
+
+
 class Generator(Model):
-    def __init__(self):
+    def __init__(self, res_blocks_num=16, momentum=0.8):
         super(Generator, self).__init__()
-        self.conv1 = layers.Conv2DTranspose(64, kernel_size=3, strides=1, padding='same', activation='relu')
-        self.res_block1 = self.res_block(64, 3, 1)
-        self.res_block2 = self.res_block(64, 3, 1)
-        self.res_block3 = self.res_block(64, 3, 1)
-        self.res_block4 = self.res_block(64, 3, 1)
-        self.res_block5 = self.res_block(64, 3, 1)
-
+        # 初始化超参数
+        self.res_blocks_num = res_blocks_num
+        self.momentum = momentum
+        # 前残差
+        self.conv1 = layers.Conv2DTranspose(64, kernel_size=9, strides=1, padding='same', activation='relu')
+        # 残差块
+        self.res = []
+        for i in range(res_blocks_num):
+            self.res.append(ResBlock(64, 3, 1))
+        # 后残差
         self.conv2 = layers.Conv2DTranspose(64, kernel_size=3, strides=1, padding='same')
-        self.norm2 = layers.BatchNormalization()
+        self.norm2 = layers.BatchNormalization(momentum=momentum)
 
-        self.conv3 = layers.Conv2DTranspose(256, kernel_size=3, strides=1, padding='same')
-
-        self.conv4 = layers.Conv2DTranspose(256, kernel_size=3, strides=1, padding='same')
-
-        self.conv5 = layers.Conv2DTranspose(3, kernel_size=3, strides=1, padding='same')
-
-    def res_block(self, filters, kernel_size, strides):
-        res_block = Sequential()
-        res_block.add(layers.Conv2DTranspose(filters, kernel_size=kernel_size, strides=strides, padding='same'))
-        res_block.add(layers.BatchNormalization())
-        res_block.add(layers.LeakyReLU(alpha=0))
-        res_block.add(layers.Conv2DTranspose(filters, kernel_size=kernel_size, strides=strides, padding='same'))
-        res_block.add(layers.BatchNormalization())
-        return res_block
-
-    def pixel_shuffle_layer(self, x, r, n_split):
-        """
-
-        :param x: [b,256,256,256]
-        :param r: 2
-        :param n_split:64
-        :return:
-        """
-
-        def PS(x, r):
-            """
-
-            :param x: [b,256,256,4]
-            :param r: 2
-            :return:
-            """
-            # bs:batchsz, a:256, b:256, c:256
-            bs, a, b, c = x.get_shape().as_list()
-            # [b,256,256,2,2]
-            x = tf.reshape(x, (bs, a, b, r, r))
-            # [b,256,256,2,2]
-            x = tf.transpose(x, [0, 1, 2, 4, 3])
-            # list: [b,1,256,2,2],...
-            x = tf.split(x, a, 1)
-            # squeeze(x[1]): [b,256,2,2], x: [b,256,512,2]
-            x = tf.concat([tf.squeeze(x_, axis=1) for x_ in x], 2)
-            # list: [b,1,512,2]
-            x = tf.split(x, b, 1)
-            # squeeze(x[1]): [b,512,2], x: [b,512,512]
-            x = tf.concat([tf.squeeze(x_, axis=1) for x_ in x], 2)
-            # [b,512,512,1]
-            return tf.reshape(x, (bs, a * r, b * r, 1))
-
-        # xc:list [b,256,256,4],[b,256,256,4]...
-        xc = tf.split(x, n_split, 3)
-        # PS: [b,512,512,1]
-        return tf.concat([PS(x_, r) for x_ in xc], 3)
+        # 上采样
+        self.up_sample1 = layers.UpSampling2D(size=2)
+        self.conv3 = layers.Conv2DTranspose(256, kernel_size=3, strides=1, padding='same', activation='relu')
+        # 上采样
+        self.up_sample2 = layers.UpSampling2D(size=2)
+        self.conv4 = layers.Conv2DTranspose(256, kernel_size=3, strides=1, padding='same', activation='relu')
+        # 输出卷积层
+        self.conv5 = layers.Conv2DTranspose(3, kernel_size=9, strides=1, padding='same', activation='tanh')
 
     def call(self, inputs, training=None, mask=None):
         """
-
         :param inputs: [b,64,64,3]
         :param training:
         :param mask:
@@ -299,57 +214,49 @@ class Generator(Model):
         """
         # [b,64,64,64]
         outputs = self.conv1(inputs)
+        # 前残差
         skip = outputs
         # [b,64,64,64]
-        outputs = outputs + self.res_block1(outputs)
-        # [b,64,64,64]
-        outputs = outputs + self.res_block2(outputs)
-        # [b,64,64,64]
-        outputs = outputs + self.res_block3(outputs)
-        # [b,64,64,64]
-        outputs = outputs + self.res_block4(outputs)
-        # [b,64,64,64]
-        outputs = outputs + self.res_block5(outputs)
-        # [b,64,64,64]
+        for i in range(self.res_blocks_num):
+            outputs = self.res[i](outputs)
+        # [b,64,64,64] 后残差
         outputs = self.norm2(self.conv2(outputs))
         # [b,64,64,64]
         outputs = outputs + skip
-        # [b,64,64,256]
-        outputs = self.conv3(outputs)
         # [b,128,128,64]
-        outputs = tf.nn.relu(self.pixel_shuffle_layer(outputs, 2, 64))
+        outputs = self.up_sample1(outputs)
         # [b,128,128,256]
+        outputs = self.conv3(outputs)
+        # [b,256,256,256]
+        outputs = self.up_sample2(outputs)
+        # [b, 256, 256, 256]
         outputs = self.conv4(outputs)
-        # (1, 256, 256, 64)
-        outputs = tf.nn.relu(self.pixel_shuffle_layer(outputs, 2, 64))
-        # (1, 256, 256, 3)
+        # [b, 256, 256, 3]
         outputs = self.conv5(outputs)
-        outputs = tf.nn.tanh(outputs)
         return outputs
 
 
 class Discriminator(Model):
-    def __init__(self):
+    def __init__(self, alpha=0.2, momentum=0.8):
         super(Discriminator, self).__init__()
-        self.relu = layers.LeakyReLU(alpha=0.2)
+        self.relu = layers.LeakyReLU(alpha=alpha)
         self.conv1 = layers.Conv2D(64, 3, 1, padding='same')
         self.conv2 = layers.Conv2D(64, 3, 2, padding='same')
-        self.norm2 = layers.BatchNormalization()
+        self.norm2 = layers.BatchNormalization(momentum=momentum)
         self.conv3 = layers.Conv2D(128, 3, 1, padding='same')
-        self.norm3 = layers.BatchNormalization()
+        self.norm3 = layers.BatchNormalization(momentum=momentum)
         self.conv4 = layers.Conv2D(128, 3, 2, padding='same')
-        self.norm4 = layers.BatchNormalization()
+        self.norm4 = layers.BatchNormalization(momentum=momentum)
         self.conv5 = layers.Conv2D(256, 3, 1, padding='same')
-        self.norm5 = layers.BatchNormalization()
+        self.norm5 = layers.BatchNormalization(momentum=momentum)
         self.conv6 = layers.Conv2D(256, 3, 2, padding='same')
-        self.norm6 = layers.BatchNormalization()
+        self.norm6 = layers.BatchNormalization(momentum=momentum)
         self.conv7 = layers.Conv2D(512, 3, 1, padding='same')
-        self.norm7 = layers.BatchNormalization()
+        self.norm7 = layers.BatchNormalization(momentum=momentum)
         self.conv8 = layers.Conv2D(512, 3, 2, padding='same')
-        self.norm8 = layers.BatchNormalization()
-        self.flat = layers.Flatten()
+        self.norm8 = layers.BatchNormalization(momentum=momentum)
         self.fc1 = layers.Dense(1024)
-        self.fc2 = layers.Dense(1)
+        self.fc2 = layers.Dense(1, activation='sigmoid')
 
     def call(self, inputs, training=None, mask=None):
         """
@@ -375,14 +282,25 @@ class Discriminator(Model):
         outputs = self.relu(self.norm7(self.conv7(outputs)))
         # [1,16,16,512]
         outputs = self.relu(self.norm8(self.conv8(outputs)))
-        # [1,131072]
-        outputs = self.flat(outputs)
 
         outputs = self.relu(self.fc1(outputs))
         outputs = self.fc2(outputs)
         return outputs
 
 
-if __name__ == '__main__':
-    srgan = SRGAN()
-    srgan.train()
+class Adversarial(Model):
+    def __init__(self, generator, discriminator):
+        super(Adversarial, self).__init__()
+        self.generator = generator
+        self.discriminator = discriminator
+
+    def call(self, inputs, training=None, mask=None):
+        """
+        :param inputs:input_low_resolution
+        :param training:
+        :param mask:
+        :return:
+        """
+        generated_high_resolution_images = self.generator(inputs)
+        probs = self.discriminator(generated_high_resolution_images)
+        return probs, generated_high_resolution_images
