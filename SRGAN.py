@@ -11,6 +11,8 @@ import os
 
 config = getConfig.get_config()
 
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = '3'
+
 
 class SRGAN(object):
 
@@ -36,9 +38,25 @@ class SRGAN(object):
         self.dataset_test_image_path = config['dataset_test_image_path']
         self.dataset_gan_image_path = config['dataset_gan_image_path']
         self.checkpoint_dir = config['checkpoint_dir']
+        self.check_dir()
         current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         log_dir = config['writer'] + current_time
         self.writer = tf.summary.create_file_writer(log_dir)
+
+    def check_dir(self):
+        if not os.path.exists(config['writer']):
+            os.makedirs(config['writer'])
+        if not os.path.exists(self.checkpoint_dir):
+            os.makedirs(self.checkpoint_dir)
+        if not os.path.exists(config['train_data']):
+            os.makedirs(self.dataset_test_image_path)
+            os.makedirs(self.dataset_train_image_path)
+            os.makedirs(self.dataset_gan_image_path)
+        if os.listdir(self.dataset_train_image_path):
+            print("训练图片共有%d张" % (len(os.listdir(self.dataset_train_image_path))))
+        else:
+            print("训练集无数据，请下载！！")
+            exit()
 
     def build_model(self):
         self.generator.build(input_shape=(None, 32, 32, 3))
@@ -150,7 +168,6 @@ class SRGAN(object):
         if final_image.shape[2] == 1:
             final_image = np.squeeze(final_image, axis=2)
         Image.fromarray(final_image).save(image_path)
-
 
     def down_sample_layer(self, input_x):
         """

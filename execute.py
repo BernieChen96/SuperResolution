@@ -1,6 +1,6 @@
 from SRGAN import *
-import tensorflow as tf
 import getConfig
+import os
 
 config = getConfig.get_config()
 
